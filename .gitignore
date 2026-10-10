@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.spec
+!scripts/RemoteCaptureDesk.spec
+*.pyc
+.local-test/
+.local-test-install.json
