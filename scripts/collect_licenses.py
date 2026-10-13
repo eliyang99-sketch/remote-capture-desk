@@ -7,7 +7,11 @@ from pathlib import Path
 destination = Path(sys.argv[1]) / "第三方许可"
 destination.mkdir(parents=True, exist_ok=True)
 summary = ["Third-party software notices", "", "Qt for Python / PySide6: https://code.qt.io/pyside/pyside-setup.git/", "Qt source: https://code.qt.io/qt/", "Paramiko: https://github.com/paramiko/paramiko", "", "Installed build environment versions:"]
-for distribution in sorted(importlib.metadata.distributions(), key=lambda d: d.metadata['Name'].lower()):
+# Match import precedence when an isolated dependency directory overrides site-packages.
+selected = {}
+for distribution in importlib.metadata.distributions():
+    selected.setdefault(distribution.metadata['Name'].lower().replace('_', '-'), distribution)
+for distribution in sorted(selected.values(), key=lambda d: d.metadata['Name'].lower()):
     name = distribution.metadata['Name']
     summary.append(f"{name}=={distribution.version}")
     for relative in distribution.files or []:

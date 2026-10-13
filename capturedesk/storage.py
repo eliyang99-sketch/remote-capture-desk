@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -30,7 +31,16 @@ class Store:
                 json.dump(self.data, stream, ensure_ascii=False, indent=2)
                 stream.flush()
                 os.fsync(stream.fileno())
-            tmp.replace(self.path)
+            # Windows scanners can briefly hold the destination without delete sharing.
+            # Keep the old file intact and bound retries; permanent denial still propagates.
+            for attempt in range(4):
+                try:
+                    tmp.replace(self.path)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.025 * (attempt + 1))
 
     def servers(self):
         with self.lock:
@@ -59,6 +69,19 @@ class Store:
     def setting(self, key, default=None):
         with self.lock:
             return self.data["settings"].get(key, default)
+
+    def remove_records(self, kind, ids):
+        """Only metadata is removed; never touch capture files or remote hosts."""
+        if kind not in {"servers", "tasks"}:
+            raise ValueError("不支持的记录类型")
+        with self.lock:
+            previous = self.data[kind]
+            self.data[kind] = [row for row in previous if row["id"] not in ids]
+            try:
+                self.flush()
+            except Exception:
+                self.data[kind] = previous
+                raise
 
     def set_setting(self, key, value):
         with self.lock:

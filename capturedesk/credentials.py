@@ -34,6 +34,11 @@ class Credentials:
     def remembered(self, server_id: str) -> bool:
         return bool(self._read(server_id))
 
+    def delete(self, server_id: str):
+        self.session.pop(server_id, None)
+        if self.backend and self.backend.get_password("RemoteCaptureDesk", server_id) is not None:
+            self.backend.delete_password("RemoteCaptureDesk", server_id)
+
     def set(self, server_id: str, secrets: Secrets, remember: bool):
         self.session[server_id] = secrets
         if remember:

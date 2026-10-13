@@ -273,3 +273,51 @@ def test_close_during_preflight_never_launches_capture(tmp_path):
     wait_idle(controller)
     assert t.id not in FakeRemote.started
     assert store.tasks()[0].remote_dir == ""
+
+
+def test_store_failure_is_reported_and_worker_released(tmp_path):
+    class BrokenStore:
+        def save_task(self, task):
+            raise OSError('disk full')
+    changed = []
+    controller = Controller(BrokenStore(), None, changed.append, FakeRemote)
+    controller.submit(task(tmp_path), Secrets())
+    wait_idle(controller)
+    assert changed and '保存失败' in changed[-1]['error']
+    controller.close()
+
+
+def test_submit_after_close_does_not_leave_active_task(tmp_path):
+    controller = Controller(Store(tmp_path), None, lambda _: None, FakeRemote)
+    controller.close()
+    with pytest.raises(RuntimeError, match='退出'):
+        controller.submit(task(tmp_path), Secrets())
+    assert not controller.active_ids()
+
+
+def test_diagnostics_do_not_log_exception_secrets():
+    import logging
+    from capturedesk.diagnostics import logger, record_exception
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    try:
+        try:
+            raise RuntimeError('password=very-private-test-secret')
+        except RuntimeError as error:
+            record_exception('test', error)
+        assert 'RuntimeError' in stream.getvalue()
+        assert 'very-private-test-secret' not in stream.getvalue()
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_delete_metadata_rollback_on_save_failure(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    t = task(tmp_path)
+    store.save_task(t)
+    def fail(): raise OSError('disk full')
+    monkeypatch.setattr(store, 'flush', fail)
+    with pytest.raises(OSError): store.remove_records('tasks', {t.id})
+    assert store.tasks()[0].id == t.id
+    assert Store(tmp_path).tasks()[0].id == t.id

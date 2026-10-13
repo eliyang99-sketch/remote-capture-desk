@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 from .models import Secrets, Server, Task
 from .remote import Remote
+from .diagnostics import record_exception
 
 
 class Controller:
@@ -28,6 +29,8 @@ class Controller:
 
     def submit(self, task: Task, secrets: Secrets, resume=False):
         with self.lock:
+            if self.shutdown_event.is_set():
+                raise RuntimeError("工具正在退出，不能提交新任务")
             if task.id in self.active:
                 return False
             if len(self.active) >= 10:
@@ -36,7 +39,11 @@ class Controller:
                 raise ValueError("该服务器已有正在管理的任务")
             stop = threading.Event()
             self.active[task.id] = (stop, task.server["id"])
-            self.pool.submit(self._work, task, secrets, stop, resume)
+            try:
+                self.pool.submit(self._work, task, secrets, stop, resume)
+            except Exception:
+                self.active.pop(task.id, None)
+                raise
             return True
 
     def stop(self, task_id):
@@ -58,7 +65,10 @@ class Controller:
         for remote in remotes:
             client = getattr(remote, "client", None)
             if client:
-                client.close()  # Abort pending reads; remote nohup tasks remain independent.
+                try:
+                    client.close()  # Remote nohup tasks remain independent.
+                except Exception as exc:
+                    record_exception("shutdown_connection", exc)
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _work(self, task, secrets, stop, resume):
@@ -140,13 +150,23 @@ class Controller:
             task.state = "完成（抓包异常）" if task.error else "完成"
             self.emit(task)
         except Exception as exc:
+            record_exception("capture_" + phase, exc)
             task.state = "下载失败" if phase == "download" else ("状态未知" if phase in {"launch", "monitor"} or resume else "失败")
             task.error = secrets.redact(str(exc) or type(exc).__name__)
-            self.emit(task)
+            try:
+                self.emit(task)
+            except Exception as save_error:
+                record_exception("save_task_failure", save_error)
+                task.error = "任务记录保存失败，请检查本地磁盘空间及目录权限；远端任务可能仍在运行。"
+                if not self.shutdown_event.is_set():
+                    self.changed(asdict(task))
         finally:
             try:
                 if remote:
-                    remote.close()
+                    try:
+                        remote.close()
+                    except Exception as close_error:
+                        record_exception("remote_close", close_error)
             finally:
                 with self.lock:
                     self.active.pop(task.id, None)

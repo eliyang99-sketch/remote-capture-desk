@@ -1,4 +1,4 @@
-# Windows 10/11 x64 build. Qt 6.12 uses Windows' unversioned ICU API.
+# Windows 10/11 x64 build; dependency versions are pinned in requirements-lock.txt.
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 

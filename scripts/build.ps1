@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Python = "$PSScriptRoot\..\.venv\Scripts\python.exe",
     [string]$OutputRoot = 'dist\v1.0.0'
 )

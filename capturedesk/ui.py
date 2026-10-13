@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 import threading
+import queue
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, QStandardPaths
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QUrl, QStandardPaths, QPointF
+from shiboken6 import isValid
+from PySide6.QtGui import QDesktopServices, QPainter, QPen, QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox as BaseComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
+    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView, QAbstractSpinBox,
 )
 
 from .controller import Controller
@@ -23,30 +24,32 @@ from .credentials import Credentials
 from .models import CaptureOptions, Secrets, Server, Task, identifier, safe_name
 from .remote import HostKeys, Remote
 from .storage import Store
+from .diagnostics import record_exception, set_secret_provider
+from .wireshark import find_wireshark, open_capture
 
 
 STYLE = """
 QMainWindow, QDialog { background: #f3f6fb; }
 QWidget { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 10pt; color: #1c2d46; }
-QGroupBox { background: white; border: 1px solid #dce4ef; border-radius: 8px; margin-top: 14px; padding: 14px 10px 10px; font-weight: bold; }
-QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
+QGroupBox { background: white; border: 1px solid #dce4ef; border-radius: 8px; margin-top: 0; padding: 6px; }
+QLabel#sectionTitle { color: #173366; font-size: 11pt; font-weight: bold; padding: 2px 0 8px; }
 QPushButton { padding: 7px 14px; background: white; border: 1px solid #cbd7e7; border-radius: 5px; }
 QPushButton:hover { background: #edf3ff; border-color: #7d9ee1; }
 QPushButton:disabled { color: #9da7b6; background: #edf0f5; }
 QPushButton#primary { background: #245ee8; color: white; border-color: #245ee8; font-weight: bold; }
 QPushButton#primary:disabled { background: #93abe4; }
 QLineEdit, QComboBox, QSpinBox { padding: 5px; border: 1px solid #ccd8e7; border-radius: 4px; background: white; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #245ee8; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { background: #f1f4f8; color: #8491a3; border-color: #e0e6ee; }
+QComboBox { padding-right: 26px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 24px; border: none; background: transparent; }
+QComboBox::down-arrow { image: none; }
+QSpinBox QLineEdit { border: none; padding: 0; background: transparent; }
 QTableWidget, QTextEdit { background: white; border: 1px solid #dce4ef; border-radius: 5px; selection-background-color: #e0ebff; selection-color: #163667; }
 QHeaderView::section { background: #eaf0f8; padding: 7px; border: 0; border-bottom: 1px solid #d5deeb; }
 QLabel#title { font-size: 20pt; font-weight: bold; color: #173366; }
 QLabel#muted { color: #64748b; }
 """
-
-
-class Bridge(QObject):
-    done = Signal(object, object, object)
-    task = Signal(object)
-    host = Signal(object)
 
 
 def button(text, callback, primary=False):
@@ -57,11 +60,45 @@ def button(text, callback, primary=False):
     return result
 
 
+def section(title):
+    card = QGroupBox()
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(14, 12, 14, 14)
+    layout.setSpacing(8)
+    label = QLabel(title)
+    label.setObjectName("sectionTitle")
+    layout.addWidget(label)
+    return card, layout
+
+
+class QComboBox(BaseComboBox):
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#64748b" if self.isEnabled() else "#a6b1c0"), 1.6))
+        x, y = self.width() - 14, self.height() / 2
+        painter.drawLine(QPointF(x - 4, y - 2), QPointF(x, y + 2))
+        painter.drawLine(QPointF(x, y + 2), QPointF(x + 4, y - 2))
+        painter.end()
+
+
+class NumericInput(QSpinBox):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Some Qt stylesheet/native style combinations collapse the editor when
+        # NoButtons is used. Keep an explicit inset for the buttonless field.
+        self.lineEdit().setGeometry(self.rect().adjusted(8, 4, -8, -4))
+
+
 def spin(low, high, value, suffix=""):
-    result = QSpinBox()
+    result = NumericInput()
     result.setRange(low, high)
     result.setValue(value)
     result.setSuffix(suffix)
+    result.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+    result.setMinimumHeight(32)
+    result.setToolTip("直接输入数值；聚焦后可用键盘 ↑ / ↓ 调整")
     return result
 
 
@@ -196,7 +233,7 @@ class ServerDialog(QDialog):
                     self.interface.setCurrentText(selected)
                 self.status.setText("连接成功，tcpdump 可用。已读取网卡，请确认选择。")
 
-        self.main.background(work, done)
+        self.main.background(work, done, owner=self)
 
     def save(self):
         try:
@@ -217,17 +254,17 @@ class MainWindow(QMainWindow):
         self.resize(1320, 900)
         self.store = store or Store()
         self.credentials = Credentials()
-        self.bridge = Bridge()
-        self.bridge.done.connect(lambda callback, result, error: callback(result, error))
-        self.bridge.task.connect(self.task_changed)
-        self.bridge.host.connect(self.host_prompt)
+        set_secret_provider(lambda: tuple(self.credentials.session.copy().values()))
+        self.events = queue.SimpleQueue()
         self.closing = threading.Event()
         self.pending_prompts = []
         self.background_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="probe")
         self.host_keys = HostKeys(self.store.root / "known_hosts", self.confirm_host)
-        self.controller = Controller(self.store, self.host_keys, self.bridge.task.emit)
+        self.controller = Controller(self.store, self.host_keys,
+                                     lambda snapshot: self.events.put(("task", snapshot)))
         self.servers = self.store.servers()
         self.tasks = {t.id: t for t in self.store.tasks()}
+        self.deleted_task_ids = set()
         self.preview_busy = False
         for task in self.tasks.values():
             if task.state in {"连接中", "检查环境", "启动中", "抓包中", "停止中", "下载中", "重新连接"}:
@@ -247,11 +284,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
         split = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(split, 2)
-        server_group = QGroupBox("1  选择服务器")
-        left = QVBoxLayout(server_group)
+        server_group, left = section("1  选择服务器")
         row = QHBoxLayout()
         row.addWidget(button("添加服务器", self.add_server))
         row.addWidget(button("编辑 / 凭据", self.edit_server))
+        row.addWidget(button("删除服务器", self.delete_server))
         row.addStretch()
         left.addLayout(row)
         self.server_table = table(["选择", "名称", "地址", "用户", "网卡", "权限"])
@@ -259,8 +296,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.server_table)
         left.addWidget(QLabel("勾选要抓包的服务器，最多 10 台。双击可编辑配置。"))
         split.addWidget(server_group)
-        config_group = QGroupBox("2  设置抓包")
-        config = QVBoxLayout(config_group)
+        config_group, config = section("2  设置抓包")
         form = QFormLayout()
         self.duration = spin(1, 86400, 600, " 秒")
         self.size = spin(1, 102400, 500, " MiB")
@@ -303,12 +339,12 @@ class MainWindow(QMainWindow):
         self.start_button = button("预览并开始抓包", self.start_preview, True)
         output.addWidget(self.start_button)
         layout.addLayout(output)
-        tasks_group = QGroupBox("3  抓包任务与历史")
-        task_layout = QVBoxLayout(tasks_group)
+        tasks_group, task_layout = section("3  抓包任务与历史")
         actions = QHBoxLayout()
         for text, handler in (("停止所选", self.stop_selected), ("停止全部", self.stop_all),
                               ("恢复连接 / 重试下载", self.resume_selected), ("打开目录", self.open_folder),
-                              ("Wireshark 打开", self.open_wireshark)):
+                              ("Wireshark 打开", self.open_wireshark), ("设置 Wireshark", self.configure_wireshark),
+                              ("删除所选历史", self.delete_history)):
             actions.addWidget(button(text, handler))
         actions.addStretch()
         task_layout.addLayout(actions)
@@ -322,22 +358,85 @@ class MainWindow(QMainWindow):
         task_layout.addWidget(self.details)
         layout.addWidget(tasks_group, 2)
         self.statusBar().showMessage("就绪 · 服务器文件不会自动删除")
+        self.statusBar().addPermanentWidget(button("诊断日志", self.open_diagnostics))
         self.render_servers()
         self.render_tasks()
+        self.dispatch_timer = QTimer(self)
+        self.dispatch_timer.setInterval(50)
+        self.dispatch_timer.timeout.connect(self.drain_events)
+        self.dispatch_timer.start()
 
-    def background(self, work, callback):
+    def drain_events(self):
+        # No worker invokes Qt or crosses its Python-object signal converter.
+        # Pause dispatch while a handler opens a nested modal event loop.
+        self.dispatch_timer.stop()
+        dirty = False
+        deadline = time.monotonic() + 0.02
+        try:
+            for _ in range(100):
+                if time.monotonic() >= deadline:
+                    break
+                if self.closing.is_set():
+                    return
+                try:
+                    kind, payload = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if kind == "done":
+                        self.background_done(*payload)
+                    elif kind == "task":
+                        if payload["id"] not in self.deleted_task_ids:
+                            self.tasks[payload["id"]] = Task(**payload)
+                            dirty = True
+                    elif kind == "host":
+                        try:
+                            self.host_prompt(payload)
+                        finally:
+                            payload["event"].set()
+                except Exception as exc:
+                    record_exception("dispatch_" + kind, exc)
+                    self.statusBar().showMessage("界面更新异常，已记录诊断，请检查任务状态。")
+        finally:
+            if not self.closing.is_set():
+                try:
+                    if dirty:
+                        self.render_tasks()
+                except Exception as exc:
+                    record_exception("render_tasks", exc)
+                finally:
+                    self.dispatch_timer.start()
+
+    def background_done(self, destination, result, error):
+        callback, owner = destination
+        if self.closing.is_set() or not isValid(owner):
+            return
+        if owner is not self and not owner.isVisible():
+            return
+        try:
+            callback(result, error)
+        except Exception as exc:
+            record_exception("gui_callback", exc)
+            self.preview_busy = False
+            self.start_button.setEnabled(True)
+            self.statusBar().showMessage("界面操作异常，已记录诊断；请检查任务状态后重试。")
+
+    def background(self, work, callback, owner=None):
+        if self.closing.is_set():
+            return
+        destination = (callback, owner if owner is not None else self)
         def run():
             try:
                 result, error = work(), None
             except Exception as exc:
                 result, error = None, str(exc)
             if not self.closing.is_set():
-                self.bridge.done.emit(callback, result, error)
+                self.events.put(("done", (destination, result, error)))
         self.background_pool.submit(run)
 
     def confirm_host(self, hostname, algorithm, fingerprint):
         request = dict(host=hostname, algorithm=algorithm, fingerprint=fingerprint, event=threading.Event(), accepted=False)
-        self.bridge.host.emit(request)
+        self.events.put(("host", request))
         while not request["event"].wait(0.2):
             if self.closing.is_set():
                 return False
@@ -394,6 +493,62 @@ class MainWindow(QMainWindow):
             self.store.save_servers(self.servers)
             self.render_servers()
 
+    def protected_task(self, task):
+        return (task.id in self.controller.active_ids()
+                or task.state not in {"完成", "完成（抓包异常）", "失败", "下载失败"})
+
+    def delete_server(self):
+        row = self.server_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "删除服务器", "请先点击选择要删除的服务器行。")
+            return
+        server = self.servers[row]
+        if self.preview_busy or any(t.server["id"] == server.id and self.protected_task(t)
+                                    for t in self.tasks.values()):
+            QMessageBox.warning(self, "暂不能删除", "该服务器有正在处理或状态未确认的任务。请先停止任务，或恢复连接确认状态。")
+            return
+        if QMessageBox.question(self, "删除服务器", f"删除服务器“{server.name}”的配置及保存的凭据？\n历史任务和所有抓包文件会保留。",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.remove_records("servers", {server.id})
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self.servers = [s for s in self.servers if s.id != server.id]
+        self.render_servers()
+        try:
+            self.credentials.delete(server.id)
+        except Exception:
+            QMessageBox.warning(self, "凭据清理未完成", "服务器配置已删除，但凭据管理器未能清理保存的凭据。请在 Windows 凭据管理器检查对应条目。")
+        self.statusBar().showMessage("服务器配置已删除；历史和抓包文件已保留。")
+
+    def delete_history(self):
+        tasks = self.selected_tasks()
+        if not tasks:
+            QMessageBox.information(self, "删除历史", "请先选择历史任务，可按 Ctrl / Shift 多选。")
+            return
+        if any(self.protected_task(t) for t in tasks):
+            QMessageBox.warning(self, "暂不能删除", "所选任务包含正在处理或状态未知的任务，请先停止或恢复连接确认状态。")
+            return
+        if QMessageBox.question(self, "删除历史", f"删除选中的 {len(tasks)} 条历史记录？\n仅移除列表记录，本地和服务器上的抓包文件均保留。",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        ids = {t.id for t in tasks}
+        try:
+            self.store.remove_records("tasks", ids)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self.deleted_task_ids.update(ids)
+        self.task_table.clearSelection()
+        for task_id in ids:
+            self.tasks.pop(task_id, None)
+        self.render_tasks()
+        self.statusBar().showMessage(f"已删除 {len(ids)} 条历史记录，抓包文件已保留。")
+
     def choose_output(self):
         directory = QFileDialog.getExistingDirectory(self, "选择保存目录", self.output.text())
         if directory:
@@ -408,6 +563,8 @@ class MainWindow(QMainWindow):
         return result
 
     def start_preview(self):
+        if self.preview_busy or self.closing.is_set():
+            return
         try:
             selected = [server for row, server in enumerate(self.servers)
                         if self.server_table.item(row, 0).checkState() == Qt.CheckState.Checked]
@@ -495,6 +652,8 @@ class MainWindow(QMainWindow):
         self.render_tasks()
 
     def task_changed(self, snapshot):
+        if self.closing.is_set() or snapshot["id"] in self.deleted_task_ids:
+            return
         task = Task(**snapshot)
         self.tasks[task.id] = task
         self.render_tasks()
@@ -513,11 +672,17 @@ class MainWindow(QMainWindow):
             values = [f"{task.server['name']} / {task.batch}", task.state, f"{task.elapsed} 秒", f"{task.size / 1024 / 1024:.2f} MiB",
                       f"{task.progress}%", task.error or reasons.get(task.reason, task.reason)]
             for col, value in enumerate(values):
-                item = QTableWidgetItem(value.replace("\n", " ")[:180])
-                item.setData(Qt.ItemDataRole.UserRole, task.id)
-                self.task_table.setItem(row, col, item)
-                if task.id in selected:
-                    item.setSelected(True)
+                text = value.replace("\n", " ")[:180]
+                item = self.task_table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    self.task_table.setItem(row, col, item)
+                elif item.text() != text:
+                    item.setText(text)
+                if item.data(Qt.ItemDataRole.UserRole) != task.id:
+                    item.setData(Qt.ItemDataRole.UserRole, task.id)
+                if item.isSelected() != (task.id in selected):
+                    item.setSelected(task.id in selected)
         self.task_table.blockSignals(False)
         self.show_details()
 
@@ -574,24 +739,55 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def open_diagnostics(self):
+        path = self.store.root / "diagnostics"
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     def open_wireshark(self):
         tasks = self.selected_tasks()
         if not tasks or not tasks[0].local_file or not Path(tasks[0].local_file).is_file():
             QMessageBox.information(self, "打开抓包文件", "请选择已下载完成的任务。")
             return
-        executable = self.store.setting("wireshark") or shutil.which("Wireshark.exe")
+        if getattr(self, "wireshark_busy", False):
+            self.statusBar().showMessage("正在启动 Wireshark，请稍候…")
+            return
+        executable = find_wireshark(self.store.setting("wireshark"))
         if not executable:
-            candidate = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Wireshark" / "Wireshark.exe"
-            if candidate.exists():
-                executable = str(candidate)
-        if not executable or not Path(executable).is_file():
-            executable, _ = QFileDialog.getOpenFileName(self, "选择 Wireshark.exe", "", "程序 (*.exe)")
-        if executable:
+            executable = self.configure_wireshark()
+        if not executable:
+            return
+        capture = tasks[0].local_file
+        self.wireshark_busy = True
+        self.statusBar().showMessage("正在启动 Wireshark…")
+
+        def done(result, error):
+            self.wireshark_busy = False
+            if error:
+                self.statusBar().showMessage("Wireshark 启动失败，请检查程序路径或重新选择。")
+                QMessageBox.warning(self, "无法打开 Wireshark", f"{error}\n\n程序：{executable}\n文件：{capture}")
+            else:
+                self.statusBar().showMessage(result)
+
+        self.background(lambda: open_capture(executable, capture), done)
+
+    def configure_wireshark(self):
+        executable, _ = QFileDialog.getOpenFileName(
+            self, "选择 Wireshark.exe", self.store.setting("wireshark") or "",
+            "Wireshark (Wireshark.exe)")
+        if not executable:
+            self.statusBar().showMessage("已取消选择 Wireshark 程序")
+            return None
+        if Path(executable).name.lower() != "wireshark.exe" or not Path(executable).is_file():
+            QMessageBox.warning(self, "程序路径不正确", "请选择已安装的 Wireshark.exe。")
+            return None
+        try:
             self.store.set_setting("wireshark", executable)
-            try:
-                subprocess.Popen([executable, "-r", tasks[0].local_file])
-            except OSError as exc:
-                QMessageBox.warning(self, "无法启动 Wireshark", str(exc))
+        except Exception as exc:
+            QMessageBox.warning(self, "无法保存程序路径", str(exc))
+            return None
+        self.statusBar().showMessage("Wireshark 路径已保存")
+        return executable
 
     def closeEvent(self, event):
         if self.controller.active_ids() or self.preview_busy:
@@ -601,6 +797,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self.closing.set()
+        self.dispatch_timer.stop()
         self.controller.close()
         self.background_pool.shutdown(wait=False, cancel_futures=True)
         event.accept()
