@@ -27,6 +27,10 @@ class Server:
     interface: str = "any"
     remote_base: str = "/tmp"
     id: str = field(default_factory=identifier)
+    device_type: str = "linux"
+    direction: str = "both"
+    receiver_ip: str = ""
+    capabilities: dict = field(default_factory=dict)
 
     def validate(self):
         if not self.name.strip() or not self.host.strip() or not self.username.strip():
@@ -41,7 +45,12 @@ class Server:
             raise ValueError("请选择私钥文件")
         if not self.interface or self.interface.startswith("-"):
             raise ValueError("请选择有效网卡")
-        if not self.remote_base.startswith("/"):
+        if self.device_type not in {"linux", "rgos"}:
+            raise ValueError("设备类型无效")
+        if self.device_type == "rgos":
+            from .rgos_options import validate_server
+            validate_server(self)
+        if self.device_type == "linux" and not self.remote_base.startswith("/"):
             raise ValueError("远端临时目录必须是绝对路径")
         for value in asdict(self).values():
             if isinstance(value, str) and any(ord(c) < 32 for c in value):
@@ -53,9 +62,10 @@ class Secrets:
     password: str = ""
     passphrase: str = ""
     sudo_password: str = ""
+    enable_password: str = ""
 
     def redact(self, text: str) -> str:
-        for secret in (self.password, self.passphrase, self.sudo_password):
+        for secret in (self.password, self.passphrase, self.sudo_password, self.enable_password):
             if secret:
                 text = text.replace(secret, "[已隐藏]")
         return text
@@ -72,6 +82,7 @@ class CaptureOptions:
     protocol: str = "any"
     expression: str = ""
     exclude_ssh: bool = True
+    device: dict = field(default_factory=dict)
 
     def validate(self):
         if not 1 <= self.duration <= 86400:
@@ -141,6 +152,10 @@ class Task:
     error: str = ""
     local_file: str = ""
     sha256: str = ""
+    device: dict = field(default_factory=dict)
+
+    def pending_cleanup(self):
+        return bool(self.device.get("intent") and self.device.get("cleanup") != "done")
 
     @classmethod
     def create(cls, server: Server, options: CaptureOptions, batch: str, local_dir: str):

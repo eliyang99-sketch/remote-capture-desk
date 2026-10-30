@@ -259,3 +259,27 @@ def test_queue_batches_updates_and_keeps_existing_cells(tmp_path, monkeypatch):
     assert window.tasks[task.id].elapsed == 29
     assert window.task_table.item(0, 0) is cell
     window.close()
+
+
+def test_rgos_editor_limits_and_cleanup_history(tmp_path, monkeypatch):
+    from capturedesk.ui import ServerDialog
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path)
+    server = Server(host='192.0.2.1', username='admin', device_type='rgos', interface='control-plane', remote_base='tmp:',
+                    capabilities={'buffer_mb':7,'packets':100})
+    store.save_servers([server])
+    window = MainWindow(store)
+    window.server_table.item(0,0).setCheckState(Qt.CheckState.Checked)
+    assert window.device_buffer.maximum()==7 and window.device_packets.maximum()==100
+    dialog = ServerDialog(window,server)
+    dialog.enable_password.setText('enable-test')
+    saved,secret=dialog.values()
+    assert saved.device_type=='rgos' and saved.remote_base=='tmp:'
+    assert secret.enable_password=='enable-test'
+    task=Task.create(server,CaptureOptions(),'rgos',str(tmp_path))
+    task.device={'intent':True,'cleanup':'pending'}
+    task.state='已取回，待清理'
+    assert window.protected_task(task)
+    task.device['cleanup']='done';task.state='取回失败，远端已清理'
+    assert not window.protected_task(task)
+    dialog.close();window.close()

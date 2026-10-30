@@ -7,12 +7,13 @@ from dataclasses import asdict
 from .models import Secrets, Server, Task
 from .remote import Remote
 from .diagnostics import record_exception
+from .backends import create_remote
 
 
 class Controller:
     """One worker owns each task. GUI receives immutable snapshots only."""
 
-    def __init__(self, store, host_keys, changed, remote_factory=Remote):
+    def __init__(self, store, host_keys, changed, remote_factory=create_remote):
         self.store, self.host_keys, self.changed = store, host_keys, changed
         self.remote_factory = remote_factory
         self.pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="capture")
@@ -37,6 +38,11 @@ class Controller:
                 raise ValueError("最多同时管理 10 个任务，请等待或停止已有任务")
             if any(server_id == task.server["id"] for _, server_id in self.active.values()):
                 raise ValueError("该服务器已有正在管理的任务")
+            if task.server.get("device_type") == "rgos":
+                for other in self.store.tasks():
+                    same = (other.server["host"], other.server["port"]) == (task.server["host"], task.server["port"])
+                    if same and other.id != task.id and (other.pending_cleanup() or other.id in self.active):
+                        raise ValueError("该设备已有任务或待清理记录，请先恢复处理")
             stop = threading.Event()
             self.active[task.id] = (stop, task.server["id"])
             try:
@@ -63,6 +69,8 @@ class Controller:
         with self.lock:
             remotes = list(self.connections.values())
         for remote in remotes:
+            if getattr(remote, "is_device", False):
+                continue  # Its worker must stop and clean up before releasing SSH.
             client = getattr(remote, "client", None)
             if client:
                 try:
@@ -72,6 +80,8 @@ class Controller:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _work(self, task, secrets, stop, resume):
+        if task.server.get("device_type") == "rgos":
+            return self._device_work(task, secrets, stop, resume)
         remote = None
         phase = "connect"
         try:
@@ -168,6 +178,92 @@ class Controller:
                     except Exception as close_error:
                         record_exception("remote_close", close_error)
             finally:
+                with self.lock:
+                    self.active.pop(task.id, None)
+                    self.connections.pop(task.id, None)
+
+    def _device_work(self, task, secrets, stop, resume):
+        import time
+        remote = None
+        failure = ""
+        def persist():
+            self.store.save_task(task)
+            if not self.shutdown_event.is_set():
+                self.changed(asdict(task))
+        def safe_persist():
+            try:
+                persist()
+            except Exception as exc:
+                record_exception("rgos_cleanup_save", exc)
+        try:
+            task.state = "重新连接" if resume else "连接中"
+            persist()
+            remote = self.remote_factory(Server(**task.server), secrets, self.host_keys)
+            with self.lock:
+                self.connections[task.id] = remote
+            remote.connect()
+            if not resume:
+                task.state = "检查环境"
+                persist()
+                info = remote.inspect()
+                if self.shutdown_event.is_set():
+                    return
+                remote.prepare_intent(task, info)
+                persist()
+                remote.configure(task, persist)
+                if self.shutdown_event.is_set():
+                    return
+                task.state = "启动中"
+                task.device["launch_intent"] = True
+                persist()
+                remote.launch(task)
+                persist()
+            elif not task.device.get("intent"):
+                raise ValueError("没有可恢复的设备任务")
+            start = time.monotonic()
+            while not task.device.get("stopped"):
+                status = remote.check_owner(task)
+                if not status["running"] or stop.is_set() or self.shutdown_event.is_set():
+                    remote.stop(task)
+                    task.reason = "manual" if stop.is_set() else ("packet_count" if status.get("packets", 0) >= task.device.get("config", {}).get("packets", 1) else "duration")
+                    persist()
+                    break
+                task.elapsed = max(0, int(time.time()-task.device.get("started_local", time.time())))
+                task.state = "抓包中"
+                persist()
+                self.shutdown_event.wait(1)
+            if task.device.get("transfer") != "verified" and not self.shutdown_event.is_set():
+                task.state = "下载中"
+                persist()
+                def progress(n):
+                    task.progress = n
+                    persist()
+                task.local_file, task.sha256 = remote.download(task, progress, self.shutdown_event.is_set)
+                persist()
+        except Exception as exc:
+            record_exception("rgos_capture", exc)
+            failure = secrets.redact(str(exc))
+        finally:
+            try:
+                if task.pending_cleanup() and remote:
+                    task.state = "清理中"
+                    safe_persist()
+                    try:
+                        getattr(remote, "ensure_connected", remote.reconnect)()
+                        remote.cleanup(task, safe_persist)
+                    except Exception as exc:
+                        failure = (failure+"；" if failure else "")+secrets.redact(str(exc))
+                if task.pending_cleanup():
+                    task.state = "已取回，待清理" if task.local_file else "停止/清理待确认"
+                elif task.device.get("intent"):
+                    task.state = "完成" if task.local_file else "取回失败，远端已清理"
+                else:
+                    task.state = "失败"
+                task.error = failure
+                safe_persist()
+            finally:
+                if remote:
+                    remote.close()
                 with self.lock:
                     self.active.pop(task.id, None)
                     self.connections.pop(task.id, None)

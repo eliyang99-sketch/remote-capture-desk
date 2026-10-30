@@ -4,6 +4,7 @@ import os
 import threading
 import queue
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox as BaseComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView, QAbstractSpinBox,
+    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView, QAbstractSpinBox, QTabWidget, QScrollArea,
 )
 
 from .controller import Controller
@@ -26,6 +27,13 @@ from .remote import HostKeys, Remote
 from .storage import Store
 from .diagnostics import record_exception, set_secret_provider
 from .wireshark import find_wireshark, open_capture
+from .backends import create_remote
+from .rgos_options import FIELDS, capture_arguments
+
+
+def remote_for(server, secrets, keys):
+    # Keep Linux's injectable constructor used by offline workflow tests.
+    return create_remote(server, secrets, keys) if server.device_type == "rgos" else Remote(server, secrets, keys)
 
 
 STYLE = """
@@ -125,6 +133,11 @@ class ServerDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         s = self.server
+        self.device_type = QComboBox()
+        self.device_type.addItem("Linux tcpdump", "linux")
+        self.device_type.addItem("锐捷 RGOS（AC / 路由器 / 交换机）", "rgos")
+        self.device_type.setCurrentIndex(self.device_type.findData(s.device_type))
+        form.addRow("设备类型", self.device_type)
         self.name, self.host, self.username = QLineEdit(s.name), QLineEdit(s.host), QLineEdit(s.username)
         self.port = spin(1, 65535, s.port)
         self.auth = QComboBox()
@@ -146,12 +159,22 @@ class ServerDialog(QDialog):
         self.interface.setEditable(True)
         self.interface.addItem(s.interface)
         self.base = QLineEdit(s.remote_base)
+        self.direction = QComboBox()
+        for label, value in (("双向", "both"), ("入方向", "in"), ("出方向", "out")):
+            self.direction.addItem(label, value)
+        self.direction.setCurrentIndex(self.direction.findData(s.direction))
+        self.receiver_ip = QLineEdit(s.receiver_ip)
+        self.receiver_ip.setPlaceholderText("留空：使用 SSH 出口地址；设备须能访问本机 UDP 69")
+        self.enable_password = QLineEdit()
+        self.capabilities = dict(s.capabilities)
+        self.enable_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.remember = QCheckBox("安全记住凭据（Windows 凭据管理器）")
         try:
             secrets = self.main.credentials.get(s.id)
             self.password.setText(secrets.password)
             self.passphrase.setText(secrets.passphrase)
             self.sudo_password.setText(secrets.sudo_password)
+            self.enable_password.setText(secrets.enable_password)
             self.remember.setChecked(self.main.credentials.remembered(s.id))
         except Exception as exc:
             QMessageBox.warning(self, "读取凭据失败", str(exc))
@@ -160,11 +183,19 @@ class ServerDialog(QDialog):
                               ("私钥文件", key_row), ("私钥口令", self.passphrase), ("抓包权限", self.privilege),
                               ("sudo 密码", self.sudo_password), ("网卡", self.interface), ("远端临时目录", self.base)):
             form.addRow(label, widget)
-        layout.addLayout(form)
+        form.addRow("设备方向", self.direction)
+        form.addRow("TFTP 本机 IPv4", self.receiver_ip)
+        form.addRow("enable 密码（可选）", self.enable_password)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        body.setLayout(form)
+        scroll.setWidget(body)
+        layout.addWidget(scroll)
         layout.addWidget(self.remember)
         self.test_button = button("测试连接并读取网卡", self.test)
         layout.addWidget(self.test_button)
-        self.status = QLabel("支持直连 Linux SSH；测试不会启动抓包。")
+        self.status = QLabel("支持 Linux / RGOS SSH；测试只读取能力，不启动抓包。")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -175,6 +206,14 @@ class ServerDialog(QDialog):
         layout.addWidget(buttons)
         self.auth.currentIndexChanged.connect(self.toggle)
         self.privilege.currentIndexChanged.connect(self.toggle)
+        self.device_type.currentIndexChanged.connect(self.change_type)
+        self.toggle()
+
+    def change_type(self):
+        device = self.device_type.currentData() == "rgos"
+        self.base.setText("tmp:" if device else "/tmp")
+        self.interface.clear()
+        self.interface.addItem("请选择接口" if device else "any")
         self.toggle()
 
     def toggle(self):
@@ -183,28 +222,42 @@ class ServerDialog(QDialog):
         self.key.setEnabled(key)
         self.passphrase.setEnabled(key)
         self.sudo_password.setEnabled(self.privilege.currentData() == "sudo_password")
+        device = self.device_type.currentData() == "rgos"
+        self.privilege.setEnabled(not device)
+        self.sudo_password.setEnabled(not device and self.privilege.currentData() == "sudo_password")
+        for field in (self.direction, self.receiver_ip, self.enable_password):
+            field.setEnabled(device)
 
     def choose_key(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 SSH 私钥")
         if path:
             self.key.setText(path)
 
-    def values(self):
+    def values(self, testing=False):
+        device = self.device_type.currentData()
+        interface = self.interface.currentText().strip()
+        if testing and device == "rgos" and interface in {"any", "请选择接口", ""}:
+            interface = "control-plane"
         server = Server(name=self.name.text().strip(), host=self.host.text().strip(), port=self.port.value(),
                         username=self.username.text().strip(), auth=self.auth.currentData(), key_path=self.key.text().strip(),
-                        privilege=self.privilege.currentData(), interface=self.interface.currentText().strip(),
-                        remote_base=self.base.text().strip().rstrip("/") or "/", id=self.server.id)
+                        privilege="direct" if device == "rgos" else self.privilege.currentData(), interface=interface,
+                        remote_base=self.base.text().strip().rstrip("/") or "/", id=self.server.id,
+                        device_type=device, direction=self.direction.currentData(), receiver_ip=self.receiver_ip.text().strip(),
+                        capabilities=self.capabilities if device == "rgos" else {})
         server.validate()
         secrets = Secrets(self.password.text() if server.auth == "password" else "",
                           self.passphrase.text() if server.auth == "key" else "",
-                          self.sudo_password.text() if server.privilege == "sudo_password" else "")
+                          self.sudo_password.text() if server.privilege == "sudo_password" else "",
+                          self.enable_password.text() if device == "rgos" else "")
+        if any(c in secrets.enable_password for c in "\r\n\x00"):
+            raise ValueError("enable 密码不能含控制字符")
         if "\n" in secrets.sudo_password or "\r" in secrets.sudo_password:
             raise ValueError("sudo 密码不能包含换行符")
         return server, secrets
 
     def test(self):
         try:
-            server, secrets = self.values()
+            server, secrets = self.values(testing=True)
         except Exception as exc:
             QMessageBox.warning(self, "配置错误", str(exc))
             return
@@ -212,7 +265,7 @@ class ServerDialog(QDialog):
         self.status.setText("正在测试 SSH、sudo 权限、tcpdump 和网卡…")
 
         def work():
-            remote = Remote(server, secrets, self.main.host_keys)
+            remote = remote_for(server, secrets, self.main.host_keys)
             try:
                 remote.connect()
                 return remote.inspect()
@@ -226,12 +279,13 @@ class ServerDialog(QDialog):
             if error:
                 self.status.setText("连接测试失败：" + error)
             else:
+                self.capabilities = result.get("capabilities", {})
                 selected = self.interface.currentText()
                 self.interface.clear()
                 self.interface.addItems(result["interfaces"])
                 if selected in result["interfaces"]:
                     self.interface.setCurrentText(selected)
-                self.status.setText("连接成功，tcpdump 可用。已读取网卡，请确认选择。")
+                self.status.setText("连接成功，已读取接口。" + ("已有旧配置：可在 RGOS 页勾选临时接管，备份后抓包并恢复。" if result.get("conflict") else "请确认接口选择。"))
 
         self.main.background(work, done, owner=self)
 
@@ -250,7 +304,8 @@ class ServerDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, store: Store | None = None):
         super().__init__()
-        self.setWindowTitle("远程抓包 · Capture Desk")
+        from . import __version__
+        self.setWindowTitle("远程抓包 · Capture Desk "+__version__)
         self.resize(1320, 900)
         self.store = store or Store()
         self.credentials = Credentials()
@@ -267,7 +322,7 @@ class MainWindow(QMainWindow):
         self.deleted_task_ids = set()
         self.preview_busy = False
         for task in self.tasks.values():
-            if task.state in {"连接中", "检查环境", "启动中", "抓包中", "停止中", "下载中", "重新连接"}:
+            if task.pending_cleanup() or task.state in {"连接中", "检查环境", "启动中", "抓包中", "停止中", "下载中", "重新连接", "清理中"}:
                 task.state = "状态未知" if task.remote_dir else "失败"
                 if not task.remote_dir:
                     task.error = "上次启动在创建远端任务之前中断，可以重新发起抓包"
@@ -279,7 +334,7 @@ class MainWindow(QMainWindow):
         title = QLabel("远程抓包")
         title.setObjectName("title")
         layout.addWidget(title)
-        subtitle = QLabel("多台 Linux 并行抓包  /  停止后自动下载  /  Wireshark 分析")
+        subtitle = QLabel("Linux / 锐捷 RGOS 并行抓包  /  自动取回与设备清理  /  Wireshark 分析")
         subtitle.setObjectName("muted")
         layout.addWidget(subtitle)
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -297,6 +352,17 @@ class MainWindow(QMainWindow):
         left.addWidget(QLabel("勾选要抓包的服务器，最多 10 台。双击可编辑配置。"))
         split.addWidget(server_group)
         config_group, config = section("2  设置抓包")
+        tabs = QTabWidget()
+        linux_panel = QWidget()
+        device_panel = QWidget()
+        linux_scroll = QScrollArea()
+        linux_scroll.setWidgetResizable(True)
+        linux_scroll.setWidget(linux_panel)
+        linux_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        tabs.addTab(linux_scroll, "Linux tcpdump")
+        tabs.addTab(device_panel, "锐捷 RGOS")
+        config.addWidget(tabs)
+        config = QVBoxLayout(linux_panel)
         form = QFormLayout()
         self.duration = spin(1, 86400, 600, " 秒")
         self.size = spin(1, 102400, 500, " MiB")
@@ -326,6 +392,21 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         note.setObjectName("muted")
         config.addWidget(note)
+        device_layout = QFormLayout(device_panel)
+        self.device_minutes = spin(1, 60, 1, " 分钟")
+        self.device_packets = spin(1, 2147483647, 1024, " 包")
+        self.device_buffer = spin(1, 15, 2, " MB")
+        self.device_filters = {}
+        self.device_takeover = QCheckBox("临时接管已停止的旧配置（备份并在抓完后恢复）")
+        self.device_takeover.setToolTip("保留旧 pcap 文件；正在运行或无法完整还原的旧配置仍会阻止启动。")
+        self.device_summary = QLabel("全部报文；缓冲区不是文件大小硬上限。\n设备接口、方向及回传地址在设备配置中设置。\n取回失败最多重试 3 次后清理远端文件。")
+        self.device_summary.setWordWrap(True)
+        device_layout.addRow("设备原生超时", self.device_minutes)
+        device_layout.addRow("包数上限", self.device_packets)
+        device_layout.addRow("缓冲区", self.device_buffer)
+        device_layout.addRow(button("配置设备过滤条件…", self.edit_device_filters))
+        device_layout.addRow(self.device_takeover)
+        device_layout.addRow(self.device_summary)
         split.addWidget(config_group)
         split.setSizes([750, 480])
         self.mode.currentIndexChanged.connect(self.filter_mode)
@@ -349,6 +430,7 @@ class MainWindow(QMainWindow):
         actions.addStretch()
         task_layout.addLayout(actions)
         self.task_table = table(["服务器 / 批次", "状态", "时长", "文件大小", "下载", "停止原因 / 提示"])
+        self.task_table.setMinimumHeight(120)
         self.task_table.itemSelectionChanged.connect(self.show_details)
         task_layout.addWidget(self.task_table)
         self.details = QTextEdit()
@@ -357,10 +439,11 @@ class MainWindow(QMainWindow):
         self.details.setPlaceholderText("选择任务查看实际过滤条件、远端文件位置和错误详情。")
         task_layout.addWidget(self.details)
         layout.addWidget(tasks_group, 2)
-        self.statusBar().showMessage("就绪 · 服务器文件不会自动删除")
+        self.statusBar().showMessage("就绪 · RGOS 停止、取回后自动清理本任务远端文件；Linux 保留文件")
         self.statusBar().addPermanentWidget(button("诊断日志", self.open_diagnostics))
         self.render_servers()
         self.render_tasks()
+        self.server_table.itemChanged.connect(self.update_device_limits)
         self.dispatch_timer = QTimer(self)
         self.dispatch_timer.setInterval(50)
         self.dispatch_timer.timeout.connect(self.drain_events)
@@ -470,7 +553,7 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked if server.id in checked else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, server.id)
             self.server_table.setItem(row, 0, item)
-            texts = [server.name, f"{server.host}:{server.port}", server.username, server.interface,
+            texts = [server.name+(" [RGOS]" if server.device_type == "rgos" else ""), f"{server.host}:{server.port}", server.username, server.interface,
                      {"direct": "直接", "sudo": "免密 sudo", "sudo_password": "密码 sudo"}[server.privilege]]
             for col, text in enumerate(texts, 1):
                 self.server_table.setItem(row, col, QTableWidgetItem(text))
@@ -494,8 +577,8 @@ class MainWindow(QMainWindow):
             self.render_servers()
 
     def protected_task(self, task):
-        return (task.id in self.controller.active_ids()
-                or task.state not in {"完成", "完成（抓包异常）", "失败", "下载失败"})
+        return (task.pending_cleanup() or task.id in self.controller.active_ids()
+                or task.state not in {"完成", "完成（抓包异常）", "失败", "下载失败", "取回失败，远端已清理"})
 
     def delete_server(self):
         row = self.server_table.currentRow()
@@ -555,12 +638,60 @@ class MainWindow(QMainWindow):
             self.output.setText(directory)
             self.store.set_setting("output", directory)
 
-    def options(self):
+    def options(self, validate_linux=True):
         result = CaptureOptions(self.duration.value(), self.size.value(), self.count.value(), self.mode.currentData(),
                                 self.filter_host.text(), self.filter_port.text(), self.protocol.currentData(),
                                 self.bpf.text(), self.exclude.isChecked())
-        result.validate()
+        if validate_linux:
+            result.validate()
+        result.device = dict(minutes=self.device_minutes.value(), packets=self.device_packets.value(),
+                             buffer_mb=self.device_buffer.value(), filters=dict(self.device_filters),
+                             takeover=self.device_takeover.isChecked())
         return result
+
+    def update_device_limits(self, *_):
+        selected = [s for row, s in enumerate(self.servers) if s.device_type == "rgos"
+                    and self.server_table.item(row, 0) is not None
+                    and self.server_table.item(row, 0).checkState() == Qt.CheckState.Checked]
+        self.device_buffer.setMaximum(min((s.capabilities.get("buffer_mb", 15) for s in selected), default=15))
+        self.device_packets.setMaximum(min((s.capabilities.get("packets", 300000) for s in selected), default=300000))
+
+    def edit_device_filters(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("RGOS 过滤条件（字段间为 AND）")
+        dialog.resize(580, 650)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("IPv4 支持单 IP / CIDR；IPv6 为单地址。端口填写数字；协议支持 tcp/udp 或编号。"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        form = QFormLayout(body)
+        labels = dict(src_mac="源 MAC", dst_mac="目的 MAC", etype="EtherType（LLDP: 0x88cc）",
+                      ipv4_sip="源 IPv4", ipv4_dip="目的 IPv4", ipv4_sport="源 IPv4 端口", ipv4_dport="目的 IPv4 端口",
+                      ipv6_sip="源 IPv6", ipv6_dip="目的 IPv6", ipv6_sport="源 IPv6 端口", ipv6_dport="目的 IPv6 端口",
+                      v4_protocol="IPv4 协议", v6_protocol="IPv6 协议", icmpv4_type="ICMPv4 类型", icmpv4_code="ICMPv4 代码",
+                      icmpv6_type="ICMPv6 类型", icmpv6_code="ICMPv6 代码")
+        inputs = {}
+        for key in FIELDS:
+            inputs[key] = QLineEdit(self.device_filters.get(key, ""))
+            form.addRow(labels[key], inputs[key])
+        scroll.setWidget(body)
+        layout.addWidget(scroll)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        def accept():
+            values = {key: field.text().strip() for key, field in inputs.items() if field.text().strip()}
+            try:
+                cfg = capture_arguments(dict(filters=values))
+            except Exception as exc:
+                QMessageBox.warning(dialog, "过滤条件错误", str(exc))
+                return
+            self.device_filters = values
+            self.device_summary.setText((cfg["filter_cli"] or "全部报文")+"\n设备停止后取回，并清理本任务文件及配置。")
+            dialog.accept()
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def start_preview(self):
         if self.preview_busy or self.closing.is_set():
@@ -574,10 +705,10 @@ class MainWindow(QMainWindow):
             if len(active) + len(selected) > 10:
                 raise ValueError("与已有任务合计不能超过 10 台")
             # Avoid duplicate capture while an earlier task's remote state is unknown.
-            unresolved = {t.server["id"] for t in self.tasks.values() if t.state in {"状态未知", "抓包中", "启动中", "停止中", "连接中", "检查环境", "重新连接"}}
+            unresolved = {t.server["id"] for t in self.tasks.values() if t.pending_cleanup() or t.state in {"状态未知", "抓包中", "启动中", "停止中", "连接中", "检查环境", "重新连接"}}
             if any(s.id in unresolved for s in selected):
                 raise ValueError("所选服务器有未结束或状态未知的任务，请先恢复连接并确认任务已停止")
-            options = self.options()
+            options = self.options(validate_linux=any(s.device_type == "linux" for s in selected))
             directory = Path(self.output.text()).expanduser()
             if not directory.is_absolute():
                 raise ValueError("请选择绝对保存路径")
@@ -601,13 +732,28 @@ class MainWindow(QMainWindow):
 
         for server, secrets in entries:
             def work(s=server, sec=secrets):
-                remote = Remote(s, sec, self.host_keys)
+                remote = remote_for(s, sec, self.host_keys)
                 try:
                     remote.connect()
                     info = remote.inspect()
                     if s.interface not in info["interfaces"]:
                         raise ValueError(f"网卡 {s.interface} 不存在，请编辑服务器并读取网卡")
-                    return s, sec, options.effective_filter(info["connection"]), None
+                    if s.device_type == "rgos":
+                        cfg = remote.plan(options, info)
+                        if cfg.get('previous'):
+                            options.device.setdefault('approved_takeovers', {})[s.id] = cfg['previous']
+                        remote.acquire_receiver()
+                        expression = (f"RGOS: {cfg['minutes']} 分钟 / {cfg['packets']} 包 / 缓冲 {cfg['buffer_mb']} MB\n"
+                                      f"packet capture file {s.remote_base}<任务ID>.pcap buffer-size {cfg['buffer_mb']} packet-num {cfg['packets']} timeout {cfg['minutes']}\n"
+                                      f"packet capture rule <任务ID> filter {cfg['filter_cli']}\n"
+                                      f"抓包点：{s.interface} {s.direction}\nTFTP → {remote.receiver.address[0]}:69\n"
+                                      "packet capture start → stop → copy → 校验 → 逐项清理")
+                        if cfg.get('previous'):
+                            expression += ("\n\n将备份并临时移除以下旧配置；本次结束后恢复为停止状态。旧 pcap 保留：\n"
+                                           +json.dumps(cfg['previous'],ensure_ascii=False,indent=2))
+                    else:
+                        expression = options.effective_filter(info["connection"])
+                    return s, sec, expression, None
                 except Exception as exc:
                     return s, sec, None, sec.redact(str(exc))
                 finally:
@@ -620,7 +766,7 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("确认实际抓包条件")
         dialog.resize(780, 480)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"最长 {options.duration} 秒 · 大小阈值 {options.size_mib} MiB / 台 · 包数 {options.packet_count or '不限'}"))
+        layout.addWidget(QLabel(f"Linux：最长 {options.duration} 秒 · 大小阈值 {options.size_mib} MiB / 台 · 包数 {options.packet_count or '不限'}\nRGOS：使用下方各设备的分钟、包数、缓冲区参数。"))
         text = QTextEdit()
         text.setReadOnly(True)
         text.setPlainText("\n\n".join(f"{s.name if s else '服务器'} | {s.host if s else ''} | 网卡 {s.interface if s else ''}\n" +
@@ -640,7 +786,11 @@ class MainWindow(QMainWindow):
             return
         batch = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + identifier()[:8]
         for server, secrets, expression, _ in valid:
-            task = Task.create(server, options, batch, str(directory / batch / safe_name(server.name)))
+            task_options = CaptureOptions(**asdict(options))
+            approved = task_options.device.pop('approved_takeovers', {}).get(server.id)
+            if approved:
+                task_options.device['approved_backup'] = approved
+            task = Task.create(server, task_options, batch, str(directory / batch / safe_name(server.name)))
             task.effective_filter = expression
             try:
                 self.tasks[task.id] = task
@@ -692,7 +842,10 @@ class MainWindow(QMainWindow):
             self.details.clear()
             return
         t = tasks[0]
-        self.details.setPlainText(f"任务：{t.id}\n过滤：{t.effective_filter or '无'}\n远端：{t.remote_dir}\n本地：{t.local_file or t.local_dir}\nSHA-256：{t.sha256 or '尚未校验'}\n{t.error}")
+        device = (f"\n设备停止：{t.device.get('stopped', False)} / 取回：{t.device.get('transfer', 'pending')} / 清理：{t.device.get('cleanup', 'pending')}" if t.device else "")
+        if t.device.get('takeover'):
+            device += f"\n旧配置恢复：{t.device['takeover'].get('phase')} / 备份：{t.device['takeover'].get('backup_file','尚未写入')}"
+        self.details.setPlainText(f"任务：{t.id}\n过滤：{t.effective_filter or '无'}\n远端：{t.remote_dir}\n本地：{t.local_file or t.local_dir}\nSHA-256：{t.sha256 or '尚未校验'}{device}\n{t.error}")
 
     def stop_selected(self):
         for task in self.selected_tasks():
@@ -705,7 +858,7 @@ class MainWindow(QMainWindow):
         for task in list(self.tasks.values()):
             if task.id in self.controller.active_ids():
                 self.controller.stop(task.id)
-            elif task.state == "状态未知" and task.remote_dir:
+            elif (task.state == "状态未知" or task.pending_cleanup()) and task.remote_dir:
                 self.resume_one(task, stop=True)
 
     def resume_selected(self):
@@ -714,6 +867,9 @@ class MainWindow(QMainWindow):
 
     def resume_one(self, task, stop=False):
         if task.id in self.controller.active_ids():
+            return
+        if task.device and task.device.get("cleanup") == "done":
+            QMessageBox.information(self, "设备任务已清理", "此任务远端内容已经清理，请直接打开本地文件或发起新任务。")
             return
         if not task.remote_dir:
             QMessageBox.information(self, "无法恢复", f"{task.server['name']}：尚未创建远端任务，请重新发起抓包。")

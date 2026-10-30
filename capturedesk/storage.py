@@ -22,6 +22,12 @@ class Store:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
             if loaded.get("version") != 1:
                 raise ValueError("不支持的数据版本，请备份本地数据后联系维护者")
+            legacy = (any("device_type" not in s for s in loaded.get("servers", []))
+                      or any("device" not in t for t in loaded.get("tasks", [])))
+            backup = self.root / "state.pre-v1.1.0.json"
+            if legacy and not backup.exists():
+                with backup.open("xb") as stream:
+                    stream.write(self.path.read_bytes())
             self.data.update(loaded)
 
     def flush(self):

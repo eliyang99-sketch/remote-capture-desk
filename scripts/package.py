@@ -2,10 +2,17 @@
 import hashlib
 import shutil
 import zipfile
+import argparse
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
-release = root / 'dist/v1.0.0/RemoteCaptureDesk'
+parser = argparse.ArgumentParser()
+parser.add_argument('--version', default='1.1.1')
+parser.add_argument('--release-dir', type=Path)
+args = parser.parse_args()
+if not __import__('re').fullmatch(r'\d+\.\d+\.\d+', args.version):
+    parser.error('Version must be numeric major.minor.patch')
+release = args.release_dir or root / ('dist/v'+args.version+'/RemoteCaptureDesk')
 shutil.copyfile(root / 'TEST_REPORT.md', release / '测试报告.md')
 shutil.copyfile(root / 'README.md', release / '使用说明.md')
 
@@ -24,15 +31,15 @@ def archive(path, entries):
     return f'{digest.hexdigest()}  {path.name}'
 
 
-binary_path = root / 'dist/RemoteCaptureDesk-1.0.0-windows-x64.zip'
+binary_path = root / f'dist/RemoteCaptureDesk-{args.version}-windows-x64.zip'
 checksums = [archive(binary_path, [(p, str(Path('RemoteCaptureDesk') / p.relative_to(release)))
                                   for p in release.rglob('*') if p.is_file()])]
 files = [root / name for name in ['.gitignore', 'README.md', 'TEST_REPORT.md', 'main.py', 'launcher.py',
                                  'requirements.txt', 'requirements-dev.txt', 'requirements-lock.txt']]
 for directory in ('capturedesk', 'scripts', 'tests'):
     files.extend(p for p in (root / directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts)
-source_path = root / 'dist/RemoteCaptureDesk-1.0.0-source.zip'
+source_path = root / f'dist/RemoteCaptureDesk-{args.version}-source.zip'
 checksums.append(archive(source_path, [(p, str(Path('RemoteCaptureDesk-source') / p.relative_to(root))) for p in files]))
-(root / 'dist/SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
+(root / f'dist/RemoteCaptureDesk-{args.version}-SHA256.txt').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
 for path in (binary_path, source_path):
     print(f'{path.name}: {path.stat().st_size / 1024 / 1024:.2f} MiB')

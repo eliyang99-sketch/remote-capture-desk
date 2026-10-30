@@ -1,6 +1,6 @@
 ﻿param(
     [string]$Python = "$PSScriptRoot\..\.venv\Scripts\python.exe",
-    [string]$OutputRoot = 'dist\v1.0.0'
+    [string]$OutputRoot = 'dist\v1.1.1'
 )
 $ErrorActionPreference = 'Stop'
 Push-Location "$PSScriptRoot\.."
